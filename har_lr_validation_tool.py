@@ -2,7 +2,7 @@ import streamlit as st
 import json
 import re
 import pandas as pd
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 import difflib
 
 st.set_page_config(layout="wide")
@@ -15,16 +15,13 @@ st.title("HAR vs LoadRunner Validation")
 def color_status(val):
 
     if val == "Matched":
-        return "background-color: #d4edda; color: green; font-weight: bold"
+        return "color: green; font-weight: bold"
 
     if val in ["Missing in LR", "Extra in LR"]:
-        return "background-color: #f8d7da; color: red; font-weight: bold"
+        return "color: red; font-weight: bold"
 
-    if val == "Query Mismatch":
-        return "background-color: #cfe2ff; color: blue; font-weight: bold"
-
-    if val in ["Method Mismatch", "Body Mismatch"]:
-        return "background-color: #fff3cd; color: orange; font-weight: bold"
+    if val in ["Body Mismatch"]:
+        return "color: orange; font-weight: bold"
 
     return ""
 
@@ -44,7 +41,11 @@ def normalize_url(url):
         return None
 
     parsed = urlparse(url)
-    return parsed.path + "?" + parsed.query if parsed.query else parsed.path
+
+    path = parsed.path
+    query = parsed.query
+
+    return path + "?" + query if query else path
 
 ########################################
 # HAR EXTRACTION
@@ -66,11 +67,13 @@ def extract_har_requests(har):
             body = req["postData"]["text"]
 
         norm = normalize_url(url)
+
         if not norm:
             continue
 
         requests.append({
             "url": url,
+            "norm": norm,
             "method": method,
             "body": body
         })
@@ -78,110 +81,77 @@ def extract_har_requests(har):
     return requests
 
 ########################################
-# LR EXTRACTION (FINAL FIXED)
+# LR EXTRACTION (SAFE FIX)
 ########################################
 
 def extract_lr_urls(script):
 
     urls = []
 
-    pattern = r'web_(url|custom_request)\s*\((.*?)\);'
-    matches = re.findall(pattern, script, re.DOTALL)
+    pattern = r'URL=([^",\s]+)'
+    matches = re.findall(pattern, script)
 
-    for req_type, content in matches:
-
-        # Normalize weird quotes
-        content = content.replace('\\"', '"').replace('“', '"').replace('”', '"')
-
-        # URL
-        url_match = re.search(r'URL="([^"]+)"', content)
-        if not url_match:
-            continue
-
-        url = url_match.group(1)
-
-        # METHOD
-        method_match = re.search(r'Method=([A-Z]+)', content)
-        method = method_match.group(1) if method_match else ("GET" if req_type == "url" else "POST")
-
-        # BODY
-        body = ""
-
-        # Body={...}
-        m1 = re.search(r'Body=\{(.*?)\}', content, re.DOTALL)
-        if m1:
-            body = "{" + m1.group(1) + "}"
-
-        # Body="..."
-        m2 = re.search(r'Body="(.*?)"', content, re.DOTALL)
-        if m2:
-            body = m2.group(1)
-
-        # RequestBody
-        m3 = re.search(r'RequestBody="(.*?)"', content, re.DOTALL)
-        if m3:
-            body = m3.group(1)
-
-        # ITEMDATA
-        m4 = re.search(r'ITEMDATA,(.*?),"LAST"', content, re.DOTALL)
-        if m4:
-            raw = m4.group(1)
-
-            pairs = re.findall(r'"Name=([^"]+)",\s*"Value=([^"]*)"', raw)
-
-            if pairs:
-                body = "&".join([f"{k}={v}" for k, v in pairs])
-            else:
-                values = re.findall(r'"([^"]*)"', raw)
-                body = "&".join(values)
+    for url in matches:
 
         norm = normalize_url(url)
 
         if norm:
             urls.append({
                 "url": url,
-                "method": method,
-                "body": body
+                "norm": norm,
+                "method": "GET",
+                "body": ""
             })
+
+    # 🔧 Minimal body extraction (safe, won't break anything)
+    blocks = re.findall(r'web_custom_request\((.*?)\);', script, re.DOTALL)
+
+    for block in blocks:
+
+        block = block.replace('\\"', '"').replace('“', '"').replace('”', '"')
+
+        url_match = re.search(r'URL="([^"]+)"', block)
+        if not url_match:
+            continue
+
+        url = url_match.group(1)
+
+        body_match = re.search(r'Body=\{(.*?)\}', block, re.DOTALL)
+
+        body = ""
+        if body_match:
+            body = "{" + body_match.group(1) + "}"
+
+        # Update matching URL entry
+        for u in urls:
+            if u["url"] == url:
+                u["method"] = "POST"
+                u["body"] = body
 
     return urls
 
 ########################################
-# FLEXIBLE URL MATCH
+# URL MATCH (KEEP OLD LOGIC)
 ########################################
 
-def compare_url_parts(har_url, lr_url):
+def urls_match(har_url, lr_url):
 
-    har = urlparse(har_url)
-    lr = urlparse(lr_url)
+    har_url = normalize_url(har_url)
+    lr_url = normalize_url(lr_url)
 
-    har_parts = har.path.strip("/").split("/")
-    lr_parts = lr.path.strip("/").split("/")
+    if not har_url or not lr_url:
+        return False
 
-    if len(har_parts) != len(lr_parts):
-        return False, False
+    lr_url_escaped = re.escape(lr_url)
 
-    path_match = True
+    pattern = re.sub(r"\\\{.*?\\\}", r"[^/]+", lr_url_escaped)
 
-    for h, l in zip(har_parts, lr_parts):
+    pattern = "^" + pattern + ".*"
 
-        # Handle dynamic {id}
-        if re.match(r"\{.*\}", l):
-            continue
-
-        if h != l:
-            path_match = False
-            break
-
-    har_q = parse_qs(har.query)
-    lr_q = parse_qs(lr.query)
-
-    query_match = har_q == lr_q
-
-    return path_match, query_match
+    return re.search(pattern, har_url) is not None
 
 ########################################
-# BODY MATCH
+# BODY MATCH (SAFE)
 ########################################
 
 def body_match(har_body, lr_body):
@@ -192,13 +162,13 @@ def body_match(har_body, lr_body):
     if not har_body or not lr_body:
         return False
 
-    har = har_body.replace(" ", "").replace('"', '').lower()
-    lr = lr_body.replace(" ", "").replace('"', '').lower()
+    har = har_body.replace(" ", "").lower()
+    lr = lr_body.replace(" ", "").lower()
 
     return har == lr
 
 ########################################
-# COMPARE
+# COMPARE (FIX DUPLICATE ISSUE)
 ########################################
 
 def compare_urls(har_list, lr_list):
@@ -210,7 +180,6 @@ def compare_urls(har_list, lr_list):
 
         status = "Missing in LR"
         lr_match = ""
-        lr_method = ""
         lr_body = ""
 
         for i, lr in enumerate(lr_list):
@@ -218,36 +187,26 @@ def compare_urls(har_list, lr_list):
             if i in used_lr:
                 continue
 
-            path_match, query_match = compare_url_parts(har["url"], lr["url"])
+            if urls_match(har["url"], lr["url"]):
 
-            if not path_match:
-                continue
+                used_lr.add(i)
 
-            used_lr.add(i)
+                lr_match = lr["url"]
+                lr_body = lr["body"]
 
-            lr_match = lr["url"]
-            lr_method = lr["method"]
-            lr_body = lr["body"]
+                if not body_match(har["body"], lr_body):
+                    status = "Body Mismatch"
+                else:
+                    status = "Matched"
 
-            if not query_match:
-                status = "Query Mismatch"
-            elif har["method"] != lr["method"]:
-                status = "Method Mismatch"
-            elif not body_match(har["body"], lr_body):
-                status = "Body Mismatch"
-            else:
-                status = "Matched"
-
-            break
+                break
 
         rows.append({
             "HAR URL": har["url"],
             "LR URL": lr_match,
-            "HAR Method": har["method"],
-            "LR Method": lr_method,
+            "Status": status,
             "HAR Body": har["body"],
-            "LR Body": lr_body,
-            "Status": status
+            "LR Body": lr_body
         })
 
     # Extra LR
@@ -258,11 +217,9 @@ def compare_urls(har_list, lr_list):
             rows.append({
                 "HAR URL": "",
                 "LR URL": lr["url"],
-                "HAR Method": "",
-                "LR Method": lr["method"],
+                "Status": "Extra in LR",
                 "HAR Body": "",
-                "LR Body": lr["body"],
-                "Status": "Extra in LR"
+                "LR Body": lr["body"]
             })
 
     return pd.DataFrame(rows)
@@ -280,48 +237,34 @@ def show_summary(df):
 
     match_pct = (matched / total * 100) if total else 0
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4 = st.columns(4)
 
     col1.metric("Total", total)
     col2.metric("Matched", matched)
     col3.metric("Missing", missing)
-    col4.metric("Extra", extra)
-    col5.metric("Match %", f"{match_pct:.2f}%")
+    col4.metric("Match %", f"{match_pct:.2f}%")
 
 ########################################
-# DIFF VIEWER
+# DIFF
 ########################################
 
 def show_diff(har_body, lr_body):
 
-    st.subheader("🔍 Body Difference Viewer")
-
-    if not har_body and not lr_body:
-        st.info("No body present in both HAR and LR")
-        return
+    st.subheader("Body Difference")
 
     diff = difflib.ndiff(
         har_body.splitlines(),
         lr_body.splitlines()
     )
 
-    formatted = []
-    for line in diff:
-        if line.startswith("-"):
-            formatted.append(f"❌ {line}")
-        elif line.startswith("+"):
-            formatted.append(f"✅ {line}")
-        else:
-            formatted.append(line)
-
-    st.code("\n".join(formatted))
+    st.code("\n".join(diff))
 
 ########################################
 # UI
 ########################################
 
 har_file = st.file_uploader("Upload HAR File")
-lr_file = st.file_uploader("Upload LR Script (.txt)")
+lr_file = st.file_uploader("Upload LR Script")
 
 if har_file and lr_file:
 
@@ -331,16 +274,12 @@ if har_file and lr_file:
     har_requests = extract_har_requests(har_data)
     lr_urls = extract_lr_urls(lr_script)
 
-    st.subheader("Full Comparison")
-
     full = compare_urls(har_requests, lr_urls)
 
     st.write(full.style.map(color_status, subset=["Status"]))
 
     st.subheader("Summary")
     show_summary(full)
-
-    st.subheader("Deep Analysis")
 
     idx = st.number_input("Select row", 0, len(full)-1, 0)
 
