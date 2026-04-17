@@ -2,12 +2,11 @@ import streamlit as st
 import json
 import re
 import pandas as pd
-import matplotlib.pyplot as plt
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import difflib
 
 st.set_page_config(layout="wide")
-st.title("HAR vs LoadRunner Validation ")
+st.title("HAR vs LoadRunner Validation")
 
 ########################################
 # COLOR
@@ -20,6 +19,9 @@ def color_status(val):
 
     if val in ["Missing in LR", "Extra in LR"]:
         return "background-color: #f8d7da; color: red; font-weight: bold"
+
+    if val == "Query Mismatch":
+        return "background-color: #cfe2ff; color: blue; font-weight: bold"
 
     if val in ["Method Mismatch", "Body Mismatch"]:
         return "background-color: #fff3cd; color: orange; font-weight: bold"
@@ -42,11 +44,7 @@ def normalize_url(url):
         return None
 
     parsed = urlparse(url)
-
-    path = parsed.path
-    query = parsed.query
-
-    return path + "?" + query if query else path
+    return parsed.path + "?" + parsed.query if parsed.query else parsed.path
 
 ########################################
 # HAR EXTRACTION
@@ -73,7 +71,6 @@ def extract_har_requests(har):
 
         requests.append({
             "url": url,
-            "norm": norm,
             "method": method,
             "body": body
         })
@@ -81,22 +78,20 @@ def extract_har_requests(har):
     return requests
 
 ########################################
-# LR EXTRACTION (WITH BODY)
+# LR EXTRACTION (ROBUST)
 ########################################
 
 def extract_lr_urls(script):
 
     urls = []
 
-    blocks = re.split(r'web_(url|custom_request)\s*\(', script)
+    pattern = r'web_(url|custom_request)\s*\((.*?)\);'
+    matches = re.findall(pattern, script, re.DOTALL)
 
-    for i in range(1, len(blocks), 2):
-
-        req_type = blocks[i]
-        content = blocks[i+1]
+    for req_type, content in matches:
 
         # URL
-        url_match = re.search(r'URL=([^",\s]+)', content)
+        url_match = re.search(r'URL="([^"]+)"', content)
         if not url_match:
             continue
 
@@ -104,28 +99,33 @@ def extract_lr_urls(script):
 
         # METHOD
         method_match = re.search(r'Method=([A-Z]+)', content)
-        if method_match:
-            method = method_match.group(1)
-        else:
-            method = "GET" if req_type == "url" else "POST"
+        method = method_match.group(1) if method_match else ("GET" if req_type == "url" else "POST")
 
         # BODY
         body = ""
 
-        body_match_1 = re.search(r'Body=([^"]+)', content)
-        if body_match_1:
-            body = body_match_1.group(1)
+        # Body="..."
+        m1 = re.search(r'Body="(.*?)"', content, re.DOTALL)
+        if m1:
+            body = m1.group(1)
 
-        body_match_2 = re.search(r'RequestBody=([^"]+)', content)
-        if body_match_2:
-            body = body_match_2.group(1)
+        # RequestBody="..."
+        m2 = re.search(r'RequestBody="(.*?)"', content, re.DOTALL)
+        if m2:
+            body = m2.group(1)
+
+        # ITEMDATA
+        m3 = re.search(r'ITEMDATA,(.*?),"LAST"', content, re.DOTALL)
+        if m3:
+            raw = m3.group(1)
+            values = re.findall(r'"([^"]*)"', raw)
+            body = "&".join(values)
 
         norm = normalize_url(url)
 
         if norm:
             urls.append({
                 "url": url,
-                "norm": norm,
                 "method": method,
                 "body": body
             })
@@ -133,24 +133,25 @@ def extract_lr_urls(script):
     return urls
 
 ########################################
-# URL MATCH
+# URL COMPARISON (STRICT)
 ########################################
 
-def urls_match(har_url, lr_url):
+def compare_url_parts(har_url, lr_url):
 
-    har_url = normalize_url(har_url)
-    lr_url = normalize_url(lr_url)
+    har = urlparse(har_url)
+    lr = urlparse(lr_url)
 
-    if not har_url or not lr_url:
-        return False
+    path_match = har.path == lr.path
 
-    lr_url_escaped = re.escape(lr_url)
-    pattern = re.sub(r"\\\{.*?\\\}", r"[^/]+", lr_url_escaped)
+    har_q = parse_qs(har.query)
+    lr_q = parse_qs(lr.query)
 
-    return re.search("^" + pattern, har_url) is not None
+    query_match = har_q == lr_q
+
+    return path_match, query_match
 
 ########################################
-# BODY MATCH (SMART)
+# BODY MATCH
 ########################################
 
 def body_match(har_body, lr_body):
@@ -167,7 +168,7 @@ def body_match(har_body, lr_body):
     return har == lr
 
 ########################################
-# COMPARE (NO DUPLICATE MATCH)
+# COMPARE (NO DUPLICATE)
 ########################################
 
 def compare_urls(har_list, lr_list):
@@ -187,22 +188,27 @@ def compare_urls(har_list, lr_list):
             if i in used_lr:
                 continue
 
-            if urls_match(har["url"], lr["url"]):
+            path_match, query_match = compare_url_parts(har["url"], lr["url"])
 
-                used_lr.add(i)
+            if not path_match:
+                continue
 
-                lr_match = lr["url"]
-                lr_method = lr["method"]
-                lr_body = lr["body"]
+            used_lr.add(i)
 
-                if har["method"] != lr["method"]:
-                    status = "Method Mismatch"
-                elif not body_match(har["body"], lr_body):
-                    status = "Body Mismatch"
-                else:
-                    status = "Matched"
+            lr_match = lr["url"]
+            lr_method = lr["method"]
+            lr_body = lr["body"]
 
-                break
+            if not query_match:
+                status = "Query Mismatch"
+            elif har["method"] != lr["method"]:
+                status = "Method Mismatch"
+            elif not body_match(har["body"], lr_body):
+                status = "Body Mismatch"
+            else:
+                status = "Matched"
+
+            break
 
         rows.append({
             "HAR URL": har["url"],
@@ -214,7 +220,7 @@ def compare_urls(har_list, lr_list):
             "Status": status
         })
 
-    # Extra LR APIs
+    # Extra LR
     for i, lr in enumerate(lr_list):
 
         if i not in used_lr:
@@ -241,7 +247,7 @@ def show_summary(df):
     matched = len(df[df["Status"] == "Matched"])
     missing = len(df[df["Status"] == "Missing in LR"])
     extra = len(df[df["Status"] == "Extra in LR"])
-    mismatch = len(df[df["Status"].isin(["Method Mismatch", "Body Mismatch"])])
+    mismatch = len(df[df["Status"].isin(["Method Mismatch", "Body Mismatch", "Query Mismatch"])])
 
     match_pct = (matched / total * 100) if total else 0
 
