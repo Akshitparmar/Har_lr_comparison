@@ -78,7 +78,7 @@ def extract_har_requests(har):
     return requests
 
 ########################################
-# LR EXTRACTION (ROBUST)
+# LR EXTRACTION (FINAL FIXED)
 ########################################
 
 def extract_lr_urls(script):
@@ -89,6 +89,9 @@ def extract_lr_urls(script):
     matches = re.findall(pattern, script, re.DOTALL)
 
     for req_type, content in matches:
+
+        # Normalize weird quotes
+        content = content.replace('\\"', '"').replace('“', '"').replace('”', '"')
 
         # URL
         url_match = re.search(r'URL="([^"]+)"', content)
@@ -104,22 +107,33 @@ def extract_lr_urls(script):
         # BODY
         body = ""
 
-        # Body="..."
-        m1 = re.search(r'Body="(.*?)"', content, re.DOTALL)
+        # Body={...}
+        m1 = re.search(r'Body=\{(.*?)\}', content, re.DOTALL)
         if m1:
-            body = m1.group(1)
+            body = "{" + m1.group(1) + "}"
 
-        # RequestBody="..."
-        m2 = re.search(r'RequestBody="(.*?)"', content, re.DOTALL)
+        # Body="..."
+        m2 = re.search(r'Body="(.*?)"', content, re.DOTALL)
         if m2:
             body = m2.group(1)
 
-        # ITEMDATA
-        m3 = re.search(r'ITEMDATA,(.*?),"LAST"', content, re.DOTALL)
+        # RequestBody
+        m3 = re.search(r'RequestBody="(.*?)"', content, re.DOTALL)
         if m3:
-            raw = m3.group(1)
-            values = re.findall(r'"([^"]*)"', raw)
-            body = "&".join(values)
+            body = m3.group(1)
+
+        # ITEMDATA
+        m4 = re.search(r'ITEMDATA,(.*?),"LAST"', content, re.DOTALL)
+        if m4:
+            raw = m4.group(1)
+
+            pairs = re.findall(r'"Name=([^"]+)",\s*"Value=([^"]*)"', raw)
+
+            if pairs:
+                body = "&".join([f"{k}={v}" for k, v in pairs])
+            else:
+                values = re.findall(r'"([^"]*)"', raw)
+                body = "&".join(values)
 
         norm = normalize_url(url)
 
@@ -133,7 +147,7 @@ def extract_lr_urls(script):
     return urls
 
 ########################################
-# URL COMPARISON (STRICT)
+# FLEXIBLE URL MATCH
 ########################################
 
 def compare_url_parts(har_url, lr_url):
@@ -141,7 +155,23 @@ def compare_url_parts(har_url, lr_url):
     har = urlparse(har_url)
     lr = urlparse(lr_url)
 
-    path_match = har.path == lr.path
+    har_parts = har.path.strip("/").split("/")
+    lr_parts = lr.path.strip("/").split("/")
+
+    if len(har_parts) != len(lr_parts):
+        return False, False
+
+    path_match = True
+
+    for h, l in zip(har_parts, lr_parts):
+
+        # Handle dynamic {id}
+        if re.match(r"\{.*\}", l):
+            continue
+
+        if h != l:
+            path_match = False
+            break
 
     har_q = parse_qs(har.query)
     lr_q = parse_qs(lr.query)
@@ -162,13 +192,13 @@ def body_match(har_body, lr_body):
     if not har_body or not lr_body:
         return False
 
-    har = har_body.replace(" ", "").lower()
-    lr = lr_body.replace(" ", "").lower()
+    har = har_body.replace(" ", "").replace('"', '').lower()
+    lr = lr_body.replace(" ", "").replace('"', '').lower()
 
     return har == lr
 
 ########################################
-# COMPARE (NO DUPLICATE)
+# COMPARE
 ########################################
 
 def compare_urls(har_list, lr_list):
@@ -247,7 +277,6 @@ def show_summary(df):
     matched = len(df[df["Status"] == "Matched"])
     missing = len(df[df["Status"] == "Missing in LR"])
     extra = len(df[df["Status"] == "Extra in LR"])
-    mismatch = len(df[df["Status"].isin(["Method Mismatch", "Body Mismatch", "Query Mismatch"])])
 
     match_pct = (matched / total * 100) if total else 0
 
@@ -271,10 +300,10 @@ def show_diff(har_body, lr_body):
         st.info("No body present in both HAR and LR")
         return
 
-    har_lines = har_body.splitlines()
-    lr_lines = lr_body.splitlines()
-
-    diff = difflib.ndiff(har_lines, lr_lines)
+    diff = difflib.ndiff(
+        har_body.splitlines(),
+        lr_body.splitlines()
+    )
 
     formatted = []
     for line in diff:
@@ -313,13 +342,8 @@ if har_file and lr_file:
 
     st.subheader("Deep Analysis")
 
-    selected_index = st.number_input(
-        "Select row number",
-        min_value=0,
-        max_value=len(full)-1,
-        step=1
-    )
+    idx = st.number_input("Select row", 0, len(full)-1, 0)
 
-    row = full.iloc[selected_index]
+    row = full.iloc[idx]
 
     show_diff(row["HAR Body"], row["LR Body"])
