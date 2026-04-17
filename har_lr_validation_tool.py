@@ -81,21 +81,44 @@ def extract_har_requests(har):
     return requests
 
 ########################################
-# LR EXTRACTION
+# LR EXTRACTION (WITH BODY)
 ########################################
 
 def extract_lr_urls(script):
 
     urls = []
 
-    pattern = r'web_(url|custom_request)[\s\S]*?URL=([^",\s]+)'
+    blocks = re.split(r'web_(url|custom_request)\s*\(', script)
 
-    matches = re.findall(pattern, script)
+    for i in range(1, len(blocks), 2):
 
-    for m in matches:
+        req_type = blocks[i]
+        content = blocks[i+1]
 
-        method = "GET" if m[0] == "url" else "POST"
-        url = m[1]
+        # URL
+        url_match = re.search(r'URL=([^",\s]+)', content)
+        if not url_match:
+            continue
+
+        url = url_match.group(1)
+
+        # METHOD
+        method_match = re.search(r'Method=([A-Z]+)', content)
+        if method_match:
+            method = method_match.group(1)
+        else:
+            method = "GET" if req_type == "url" else "POST"
+
+        # BODY
+        body = ""
+
+        body_match_1 = re.search(r'Body=([^"]+)', content)
+        if body_match_1:
+            body = body_match_1.group(1)
+
+        body_match_2 = re.search(r'RequestBody=([^"]+)', content)
+        if body_match_2:
+            body = body_match_2.group(1)
 
         norm = normalize_url(url)
 
@@ -104,7 +127,7 @@ def extract_lr_urls(script):
                 "url": url,
                 "norm": norm,
                 "method": method,
-                "body": ""  # extendable
+                "body": body
             })
 
     return urls
@@ -127,7 +150,7 @@ def urls_match(har_url, lr_url):
     return re.search("^" + pattern, har_url) is not None
 
 ########################################
-# BODY MATCH
+# BODY MATCH (SMART)
 ########################################
 
 def body_match(har_body, lr_body):
@@ -135,13 +158,16 @@ def body_match(har_body, lr_body):
     if not har_body and not lr_body:
         return True
 
-    if har_body and lr_body:
-        return har_body.strip() == lr_body.strip()
+    if not har_body or not lr_body:
+        return False
 
-    return False
+    har = har_body.replace(" ", "").lower()
+    lr = lr_body.replace(" ", "").lower()
+
+    return har == lr
 
 ########################################
-# COMPARE (NO DUPLICATE)
+# COMPARE (NO DUPLICATE MATCH)
 ########################################
 
 def compare_urls(har_list, lr_list):
@@ -154,7 +180,6 @@ def compare_urls(har_list, lr_list):
         status = "Missing in LR"
         lr_match = ""
         lr_method = ""
-        har_body = har["body"]
         lr_body = ""
 
         for i, lr in enumerate(lr_list):
@@ -172,7 +197,7 @@ def compare_urls(har_list, lr_list):
 
                 if har["method"] != lr["method"]:
                     status = "Method Mismatch"
-                elif not body_match(har_body, lr_body):
+                elif not body_match(har["body"], lr_body):
                     status = "Body Mismatch"
                 else:
                     status = "Matched"
@@ -184,11 +209,12 @@ def compare_urls(har_list, lr_list):
             "LR URL": lr_match,
             "HAR Method": har["method"],
             "LR Method": lr_method,
-            "HAR Body": har_body,
+            "HAR Body": har["body"],
             "LR Body": lr_body,
             "Status": status
         })
 
+    # Extra LR APIs
     for i, lr in enumerate(lr_list):
 
         if i not in used_lr:
@@ -244,16 +270,16 @@ def show_diff(har_body, lr_body):
 
     diff = difflib.ndiff(har_lines, lr_lines)
 
-    diff_text = []
+    formatted = []
     for line in diff:
         if line.startswith("-"):
-            diff_text.append(f"❌ {line}")
+            formatted.append(f"❌ {line}")
         elif line.startswith("+"):
-            diff_text.append(f"✅ {line}")
+            formatted.append(f"✅ {line}")
         else:
-            diff_text.append(line)
+            formatted.append(line)
 
-    st.code("\n".join(diff_text))
+    st.code("\n".join(formatted))
 
 ########################################
 # UI
@@ -279,10 +305,10 @@ if har_file and lr_file:
     st.subheader("Summary")
     show_summary(full)
 
-    st.subheader("Select Row for Deep Analysis")
+    st.subheader("Deep Analysis")
 
     selected_index = st.number_input(
-        "Enter row number",
+        "Select row number",
         min_value=0,
         max_value=len(full)-1,
         step=1
